@@ -1,0 +1,12 @@
+{
+  "_comment": "Placeholder bootstrap allowlist. Real test/service chats live in an untracked config/clients.local.json; point the bot at it with CLIENTS_FILE=config/clients.local.json (FIX-10). Keep only obviously fake entries here.",
+  "clients": [
+    {
+      "chat_id": 111111111,
+      "name": "Test Client",
+      "company": "Test Co",
+      "services": ["CDN", "SecurityCDN"],
+      "priority": "NORMAL"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+[Unit]
+Description=Redis for support bot (AOF persistence)
+After=network.target
+
+[Service]
+Type=notify
+User=redis
+Group=redis
+# FIX-16: require a password even on loopback. The AOF on disk holds conversation
+# contents, auth bindings and cached OAuth tokens, so a local process must not be
+# able to read them unauthenticated. The password is kept out of the unit (which
+# is world-readable) in /etc/redis/requirepass.conf (mode 600, owner redis):
+#
+#   echo "requirepass <STRONG_SECRET>" > /etc/redis/requirepass.conf
+#   chmod 600 /etc/redis/requirepass.conf && chown redis:redis /etc/redis/requirepass.conf
+#
+# Set the same secret as REDIS_PASSWORD in /opt/bot/.env (and tokengen does not
+# need Redis). Also ensure /var/lib/redis is mode 700, owner redis.
+ExecStart=/usr/bin/redis-server /etc/redis/requirepass.conf --appendonly yes --appendfsync everysec --dir /var/lib/redis --bind 127.0.0.1 --port 6379
+ExecStop=/usr/bin/redis-cli shutdown
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

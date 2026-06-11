@@ -1,0 +1,28 @@
+[Unit]
+Description=Support bot binding-token generator
+After=network.target
+
+[Service]
+Type=simple
+User=supportbot
+Group=supportbot
+WorkingDirectory=/opt/bot
+# Least privilege: tokengen only needs the binding-token settings, never the
+# bot's Zoho OAuth credentials or Telegram token. Keep its environment in a
+# separate file so a compromise of the token minter does not expose those (FIX-9).
+# BINDING_TOKEN_SECRET must stay byte-identical to the bot's value (the code
+# trims trailing whitespace defensively — keep that).
+EnvironmentFile=/opt/bot/tokengen.env
+ExecStart=/opt/bot/tokengen
+Restart=always
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/bot
+
+[Install]
+WantedBy=multi-user.target

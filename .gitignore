@@ -1,0 +1,10 @@
+# Secrets and environment
+.env
+tokengen.env
+
+# Untracked bootstrap allowlist holding real test/service chat IDs (FIX-10).
+# The tracked config/clients.json keeps only fake placeholders.
+config/clients.local.json
+
+# Build artifacts
+/build/

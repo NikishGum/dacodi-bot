@@ -1,0 +1,24 @@
+[Unit]
+Description=Telegram support bot
+After=redis.service network.target
+Wants=redis.service
+
+[Service]
+Type=simple
+User=supportbot
+Group=supportbot
+WorkingDirectory=/opt/bot
+EnvironmentFile=/opt/bot/.env
+ExecStart=/opt/bot/supportbot
+Restart=always
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/bot
+
+[Install]
+WantedBy=multi-user.target
