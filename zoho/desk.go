@@ -51,9 +51,22 @@ type AccountInfo struct {
 	ID          string
 	Name        string
 	BotClientID uint32
-	ChatID      int64 // 0 when not bound
-	Services    []string
-	Priority    string
+	// ChatIDs are all Telegram chats bound to this account. An account may have
+	// several (a company with multiple employees), stored comma-separated in the
+	// cf_telegram_chat_id field; empty when none is bound.
+	ChatIDs  []int64
+	Services []string
+	Priority string
+}
+
+// HasChat reports whether chatID is among the account's bound chats.
+func (a AccountInfo) HasChat(chatID int64) bool {
+	for _, c := range a.ChatIDs {
+		if c == chatID {
+			return true
+		}
+	}
+	return false
 }
 
 // Desk provides typed Zoho Desk operations over the base Client.
@@ -402,7 +415,7 @@ func (d *Desk) AccountByChatID(ctx context.Context, chatID int64) (*AccountInfo,
 			d.logger.Warn("fetching account detail failed", "account_id", accounts[i].ID, "error", err)
 			continue
 		}
-		if cfInt64(full.CF, d.cfChatID) == chatID {
+		if containsInt64(cfInt64s(full.CF, d.cfChatID), chatID) {
 			info := d.toAccountInfo(full)
 			return &info, nil
 		}
@@ -439,22 +452,27 @@ func (d *Desk) AccountByID(ctx context.Context, id string) (*AccountInfo, error)
 	return &info, nil
 }
 
-// SetAccountChatID writes the bound Telegram chat ID onto the account. Passing
-// chatID 0 clears the field (used on revocation).
-func (d *Desk) SetAccountChatID(ctx context.Context, accountID string, chatID int64) error {
-	value := ""
-	if chatID != 0 {
-		value = strconv.FormatInt(chatID, 10)
+// SetAccountChatIDs writes the full set of bound Telegram chat IDs onto the
+// account, comma-separated in the cf_telegram_chat_id field. An empty slice
+// clears the field (last chat unbound). The registry computes the new set
+// (append on bind, remove on unbind) under a per-account lock, so this method is
+// a plain overwrite.
+func (d *Desk) SetAccountChatIDs(ctx context.Context, accountID string, chatIDs []int64) error {
+	parts := make([]string, 0, len(chatIDs))
+	for _, c := range chatIDs {
+		if c != 0 {
+			parts = append(parts, strconv.FormatInt(c, 10))
+		}
 	}
 	payload := map[string]any{
 		"cf": map[string]any{
-			d.cfChatID: value,
+			d.cfChatID: strings.Join(parts, ","),
 		},
 	}
 	if err := d.client.do(ctx, "PATCH", "/api/v1/accounts/"+accountID, payload, nil); err != nil {
-		return fmt.Errorf("updating account %s chat id: %w", accountID, err)
+		return fmt.Errorf("updating account %s chat ids: %w", accountID, err)
 	}
-	d.logger.Info("zoho account chat id updated", "account_id", accountID, "chat_id", chatID)
+	d.logger.Info("zoho account chat ids updated", "account_id", accountID, "chat_count", len(parts))
 	return nil
 }
 
@@ -482,7 +500,7 @@ func (d *Desk) toAccountInfo(a accountRaw) AccountInfo {
 		ID:          a.ID,
 		Name:        a.AccountName,
 		BotClientID: cfUint32(a.CF, d.cfBotClientID),
-		ChatID:      cfInt64(a.CF, d.cfChatID),
+		ChatIDs:     cfInt64s(a.CF, d.cfChatID),
 		Services:    cfStrings(a.CF, d.cfServices),
 		Priority:    cfString(a.CF, d.cfPriority),
 	}
@@ -528,16 +546,27 @@ func cfUint32(cf map[string]any, key string) uint32 {
 	return uint32(n)
 }
 
-func cfInt64(cf map[string]any, key string) int64 {
-	s := cfString(cf, key)
-	if s == "" {
-		return 0
+// cfInt64s parses a multi-valued chat-ID field: either a native list or a
+// comma-separated string (how we store multiple chats in cf_telegram_chat_id).
+// Unparsable or zero entries are skipped.
+func cfInt64s(cf map[string]any, key string) []int64 {
+	var out []int64
+	for _, s := range cfStrings(cf, key) {
+		n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+		if err == nil && n != 0 {
+			out = append(out, n)
+		}
 	}
-	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-	if err != nil {
-		return 0
+	return out
+}
+
+func containsInt64(list []int64, v int64) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
 	}
-	return n
+	return false
 }
 
 func cfStrings(cf map[string]any, key string) []string {

@@ -124,6 +124,18 @@ func (b *Bot) handleUnboundPrompt(ctx context.Context, chatID int64, update tgbo
 	}
 
 	token := strings.TrimSpace(msg.Text)
+
+	// In a group chat the bot may receive every member message (privacy mode off),
+	// so it must not nudge "send your key" on each one. Only a token-shaped message
+	// is acted on in a group; other chatter is ignored silently. In a private chat
+	// any text is treated as a key attempt and gets the prompt.
+	if msg.Chat != nil && !msg.Chat.IsPrivate() {
+		if looksLikeBindingToken(token) {
+			b.handleBinding(ctx, chatID, token)
+		}
+		return
+	}
+
 	if token == "" {
 		b.send(chatID, askKey)
 		return
@@ -134,6 +146,17 @@ func (b *Bot) handleUnboundPrompt(ctx context.Context, chatID int64, update tgbo
 // handleBinding redeems a binding token and, on success, starts the support
 // flow for the now-bound chat.
 func (b *Bot) handleBinding(ctx context.Context, chatID int64, token string) {
+	token = strings.TrimSpace(token)
+
+	// Shape precheck BEFORE touching the attempt counter: a chat that simply
+	// types "здравствуйте" while unbound must not burn its brute-force budget and
+	// get locked out for an hour. Only strings shaped like a real token (which an
+	// attacker would have to guess) count as attempts.
+	if !looksLikeBindingToken(token) {
+		b.send(chatID, "Это не похоже на ключ доступа. Отправьте ключ одной строкой — его выдаёт ваш менеджер.")
+		return
+	}
+
 	// Fail closed: if the attempt counter cannot be read, refuse rather than let
 	// binding proceed without a brute-force guard (FIX-7). This is consistent —
 	// ClaimToken below also requires Redis, so binding cannot succeed without it.
@@ -149,7 +172,6 @@ func (b *Bot) handleBinding(ctx context.Context, chatID int64, token string) {
 		return
 	}
 
-	token = strings.TrimSpace(token)
 	b.logger.Debug("verifying binding token", "chat_id", chatID, "token_len", len(token))
 
 	botClientID, jti, err := b.auth.Verify(token)
@@ -165,6 +187,9 @@ func (b *Bot) handleBinding(ctx context.Context, chatID int64, token string) {
 
 	claimed, err := b.store.ClaimToken(ctx, jti, b.bindingClaimTTL())
 	if err != nil {
+		// Transient Redis error: refund the attempt so an outage does not count
+		// against the client.
+		b.refundBindAttempt(ctx, chatID)
 		b.logger.Error("claiming token failed", "chat_id", chatID, "error", err)
 		b.send(chatID, "Временная ошибка. Пожалуйста, попробуйте позже.")
 		return
@@ -181,12 +206,22 @@ func (b *Bot) handleBinding(ctx context.Context, chatID int64, token string) {
 			b.send(chatID, "Ключ недействителен.")
 		case errors.Is(err, registry.ErrChatBound):
 			b.send(chatID, "Этот чат уже привязан к другому клиенту.")
+		case errors.Is(err, registry.ErrChatLimit):
+			// Definitive rejection (account full): release the claim so a freed
+			// slot can be taken later with this same token if still valid.
+			if rerr := b.store.ReleaseToken(ctx, jti); rerr != nil {
+				b.logger.Error("releasing token claim failed", "chat_id", chatID, "error", rerr)
+			}
+			b.logger.Warn("binding rejected: account chat limit reached", "chat_id", chatID, "bot_client_id", botClientID)
+			b.send(chatID, "Достигнут лимит привязанных чатов для этого клиента. Обратитесь к менеджеру, чтобы освободить место.")
 		default:
-			// Transient failure: release the claim so the client can retry.
+			// Transient failure: release the claim and refund the attempt so the
+			// client can retry once the outage clears, with budget intact.
 			b.logger.Error("binding failed", "chat_id", chatID, "bot_client_id", botClientID, "error", err)
 			if rerr := b.store.ReleaseToken(ctx, jti); rerr != nil {
 				b.logger.Error("releasing token claim failed", "chat_id", chatID, "error", rerr)
 			}
+			b.refundBindAttempt(ctx, chatID)
 			b.send(chatID, "Временная ошибка при привязке. Пожалуйста, попробуйте позже.")
 		}
 		return
@@ -197,15 +232,47 @@ func (b *Bot) handleBinding(ctx context.Context, chatID int64, token string) {
 	b.startFlow(ctx, conv, profile)
 }
 
+// refundBindAttempt cancels the attempt increment after a transient failure,
+// logging (but not surfacing) a refund error since it is best-effort.
+func (b *Bot) refundBindAttempt(ctx context.Context, chatID int64) {
+	if err := b.store.RefundBindAttempt(ctx, chatID); err != nil {
+		b.logger.Warn("refunding bind attempt failed", "chat_id", chatID, "error", err)
+	}
+}
+
+// looksLikeBindingToken reports whether s has the shape of a binding token: the
+// base64url encoding of a 32-byte token is exactly 43 characters from the
+// URL-safe alphabet. This is a cheap filter to avoid charging random chat text
+// against the brute-force counter; cryptographic validation is auth.Verify.
+func looksLikeBindingToken(s string) bool {
+	if len(s) != 43 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func (b *Bot) handleMessage(ctx context.Context, conv *Conversation, profile registry.Profile, msg *tgbotapi.Message) {
-	if msg.IsCommand() && msg.Command() == "start" {
-		// A client may have only one active ticket at a time.
-		if conv.State == StateTicketOpen {
-			b.notifyActiveTicket(ctx, conv.ChatID)
+	if msg.IsCommand() {
+		switch msg.Command() {
+		case "start":
+			// A client may have only one active ticket at a time.
+			if conv.State == StateTicketOpen {
+				b.notifyActiveTicket(ctx, conv.ChatID)
+				return
+			}
+			b.startFlow(ctx, conv, profile)
+			return
+		case "status":
+			b.handleStatus(ctx, conv)
 			return
 		}
-		b.startFlow(ctx, conv, profile)
-		return
 	}
 
 	switch conv.State {
@@ -216,7 +283,7 @@ func (b *Bot) handleMessage(ctx context.Context, conv *Conversation, profile reg
 		b.recordTextAnswer(ctx, conv, messageContent(msg))
 
 	case StateTicketOpen:
-		b.appendClientComment(ctx, conv.ChatID, messageContent(msg))
+		b.forwardToTicket(ctx, conv.ChatID, msg)
 
 	case StateAwaitingService, StateConfirming:
 		b.repromptCurrentStep(conv, profile)
@@ -413,6 +480,52 @@ func (b *Bot) finalizeTicket(ctx context.Context, conv *Conversation, profile re
 	b.send(conv.ChatID, ticketCreatedMessage(created.Number))
 }
 
+// unbindChat revokes a chat's binding and clears its local conversation/ticket
+// state so it returns to the unbound flow and the poller stops forwarding to it.
+// The Zoho ticket itself is left open for the operator to handle; only this
+// chat's access and conversation are reset. Callers hold the chat lock.
+func (b *Bot) unbindChat(ctx context.Context, chatID int64) error {
+	if err := b.registry.Revoke(ctx, chatID); err != nil {
+		return err
+	}
+	if err := b.store.DelTicket(ctx, chatID); err != nil {
+		b.logger.Warn("clearing ticket mapping on unbind failed", "chat_id", chatID, "error", err)
+	}
+	if err := b.store.DelFSM(ctx, chatID); err != nil {
+		b.logger.Warn("clearing conversation on unbind failed", "chat_id", chatID, "error", err)
+	}
+	if err := b.store.DelPendingComments(ctx, chatID); err != nil {
+		b.logger.Warn("clearing pending comments on unbind failed", "chat_id", chatID, "error", err)
+	}
+	b.send(chatID, "Доступ к поддержке для этого чата отозван. Если это ошибка — обратитесь к вашему менеджеру.")
+	return nil
+}
+
+// handleStatus replies with the chat's current support state: the open ticket
+// number when one exists, the in-progress flow when a request is being filled,
+// otherwise an invitation to start a new one.
+func (b *Bot) handleStatus(ctx context.Context, conv *Conversation) {
+	ref, err := b.store.GetTicket(ctx, conv.ChatID)
+	if err != nil {
+		b.logger.Error("reading ticket mapping failed", "chat_id", conv.ChatID, "error", err)
+	}
+	if ref.ID != "" {
+		msg := "У вас есть активное обращение"
+		if ref.Number != "" {
+			msg += " №" + ref.Number
+		}
+		msg += ". Сообщения в этом чате передаются оператору; ответы приходят сюда."
+		b.send(conv.ChatID, msg)
+		return
+	}
+	switch conv.State {
+	case StateAwaitingService, StateAskingQuestions, StateConfirming:
+		b.send(conv.ChatID, "Вы оформляете обращение. Завершите заполнение, чтобы оно было создано.")
+	default:
+		b.send(conv.ChatID, "Активных обращений нет. Отправьте /start, чтобы создать новое.")
+	}
+}
+
 // notifyActiveTicket reminds the client they already have an open ticket.
 func (b *Bot) notifyActiveTicket(ctx context.Context, chatID int64) {
 	ref, err := b.store.GetTicket(ctx, chatID)
@@ -434,31 +547,46 @@ func ticketCreatedMessage(number string) string {
 	return "Спасибо! Ваше обращение зарегистрировано. Специалист свяжется с вами здесь в ближайшее время."
 }
 
-// appendClientComment forwards a client message to the open ticket as a comment.
-// If the ticket does not exist yet (still queued), the message is buffered.
-func (b *Bot) appendClientComment(ctx context.Context, chatID int64, content string) {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return
-	}
+// forwardToTicket relays a client message on an open ticket: it uploads any
+// attached files to the ticket and posts the text as an internal comment tagged
+// with the sender's Telegram handle (so an operator can tell which employee of a
+// multi-chat account wrote it). If the ticket does not exist yet (still queued
+// during a Zoho outage) the text is buffered; attachments in that narrow window
+// are best-effort dropped — the text note ("[приложен файл]") still records them.
+func (b *Bot) forwardToTicket(ctx context.Context, chatID int64, msg *tgbotapi.Message) {
 	ref, err := b.store.GetTicket(ctx, chatID)
 	if err != nil {
 		b.logger.Error("reading ticket mapping failed", "chat_id", chatID, "error", err)
 	}
+	content := strings.TrimSpace(messageContent(msg))
+	line := clientCommentLine(msg, content)
+
 	if ref.ID == "" {
-		if err := b.store.PushPendingComment(ctx, chatID, content); err != nil {
-			b.logger.Error("buffering pending comment failed", "chat_id", chatID, "error", err)
+		if content != "" {
+			if perr := b.store.PushPendingComment(ctx, chatID, line); perr != nil {
+				b.logger.Error("buffering pending comment failed", "chat_id", chatID, "error", perr)
+			}
 		}
 		return
 	}
-	if err := b.desk.AddComment(ctx, ref.ID, "Клиент: "+content); err != nil {
+
+	if atts := attachmentsFromMessage(msg); len(atts) > 0 {
+		b.uploader.Upload(ctx, ref.ID, atts)
+	}
+	if content == "" {
+		return
+	}
+	if err := b.desk.AddComment(ctx, ref.ID, line); err != nil {
 		b.logger.Error("forwarding client comment failed, buffering", "chat_id", chatID, "ticket_id", ref.ID, "error", err)
-		if perr := b.store.PushPendingComment(ctx, chatID, content); perr != nil {
+		if perr := b.store.PushPendingComment(ctx, chatID, line); perr != nil {
 			b.logger.Error("buffering pending comment failed", "chat_id", chatID, "error", perr)
 		}
 	}
 }
 
+// flushPendingComments posts comments buffered while the ticket did not yet
+// exist. The lines are stored already formatted (handle + text), so they are
+// posted verbatim.
 func (b *Bot) flushPendingComments(ctx context.Context, chatID int64, ticketID string) {
 	comments, err := b.store.PopAllPendingComments(ctx, chatID)
 	if err != nil {
@@ -466,10 +594,32 @@ func (b *Bot) flushPendingComments(ctx context.Context, chatID int64, ticketID s
 		return
 	}
 	for _, c := range comments {
-		if err := b.desk.AddComment(ctx, ticketID, "Клиент: "+c); err != nil {
+		if err := b.desk.AddComment(ctx, ticketID, c); err != nil {
 			b.logger.Error("flushing pending comment failed", "chat_id", chatID, "ticket_id", ticketID, "error", err)
 		}
 	}
+}
+
+// clientCommentLine formats a client message for the ticket: the "Клиент" marker
+// (which operators rely on to tell client messages from the bot's own relays),
+// the sender's Telegram handle when known, then the text.
+func clientCommentLine(msg *tgbotapi.Message, content string) string {
+	if h := senderHandle(msg); h != "" {
+		return "Клиент " + h + ": " + content
+	}
+	return "Клиент: " + content
+}
+
+// senderHandle returns a human label for a message author: "@username" when set,
+// otherwise the first/last name, otherwise "" (anonymous — e.g. a channel post).
+func senderHandle(msg *tgbotapi.Message) string {
+	if msg == nil || msg.From == nil {
+		return ""
+	}
+	if msg.From.UserName != "" {
+		return "@" + msg.From.UserName
+	}
+	return strings.TrimSpace(msg.From.FirstName + " " + msg.From.LastName)
 }
 
 // repromptCurrentStep re-sends the prompt/keyboard appropriate to the state when

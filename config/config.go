@@ -54,17 +54,14 @@ type Config struct {
 	ZohoCFServices    string
 	ZohoCFPriority    string
 	ZohoContactDomain string
-	ZohoWebhookToken  string
 
 	// ZohoCFRequestID is the API name of a ticket custom field that stores the
 	// per-request idempotency key. When empty, idempotency tagging is disabled
 	// (a startup warning is logged). See FIX-5.
 	ZohoCFRequestID string
 
-	// ZohoSyncMode selects how operator replies and closures reach the bot:
-	// "poll" pulls from Zoho on a timer (no inbound webhook needed); "webhook"
-	// relies on Zoho calling /zoho/webhook.
-	ZohoSyncMode     string
+	// ZohoPollInterval is how often the poller pulls operator replies and
+	// closures from Zoho (the bot does not use inbound Zoho webhooks).
 	ZohoPollInterval time.Duration
 
 	// ZohoScanMinInterval bounds how often a cold-cache miss may trigger a full
@@ -74,6 +71,11 @@ type Config struct {
 
 	BindingTokenSecret string
 	BindingTokenTTL    time.Duration
+
+	// AdminAPIKey guards the internal POST /admin/unbind endpoint. When empty the
+	// endpoint is not mounted (unbinding is then only possible by editing the Zoho
+	// account's cf_telegram_chat_id directly).
+	AdminAPIKey string
 
 	ClientsFile string
 
@@ -112,12 +114,11 @@ func Load() (*Config, error) {
 		ZohoCFServices:        getEnv("ZOHO_CF_SERVICES", "cf_cf_bot_services"),
 		ZohoCFPriority:        getEnv("ZOHO_CF_PRIORITY", "cf_cf_bot_priority"),
 		ZohoContactDomain:     getEnv("ZOHO_CONTACT_EMAIL_DOMAIN", "telegram.support.local"),
-		ZohoWebhookToken:      os.Getenv("ZOHO_WEBHOOK_TOKEN"),
 		ZohoCFRequestID:       strings.TrimSpace(os.Getenv("ZOHO_CF_REQUEST_ID")),
-		ZohoSyncMode:          strings.ToLower(getEnv("ZOHO_SYNC_MODE", "poll")),
 		// Trimmed: a systemd EnvironmentFile keeps trailing whitespace that would
 		// desynchronize this secret from tokengen and break every signature.
 		BindingTokenSecret: strings.TrimSpace(os.Getenv("BINDING_TOKEN_SECRET")),
+		AdminAPIKey:        strings.TrimSpace(os.Getenv("ADMIN_API_KEY")),
 		ClientsFile:        getEnv("CLIENTS_FILE", "config/clients.json"),
 	}
 
@@ -129,10 +130,6 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("ZOHO_POLL_INTERVAL must be at least 5s to protect Zoho API credits, got %s", pollInterval)
 	}
 	c.ZohoPollInterval = pollInterval
-
-	if c.ZohoSyncMode != "poll" && c.ZohoSyncMode != "webhook" {
-		return nil, fmt.Errorf("ZOHO_SYNC_MODE must be 'poll' or 'webhook', got %q", c.ZohoSyncMode)
-	}
 
 	scanInterval, err := time.ParseDuration(getEnv("ZOHO_SCAN_MIN_INTERVAL", "60s"))
 	if err != nil {
@@ -171,10 +168,6 @@ func Load() (*Config, error) {
 	if c.TelegramMode == "webhook" {
 		required["TELEGRAM_WEBHOOK_SECRET"] = c.TelegramWebhookSecret
 		required["PUBLIC_BASE_URL"] = c.PublicBaseURL
-	}
-	// The Zoho webhook secret is only meaningful when Zoho pushes to us.
-	if c.ZohoSyncMode == "webhook" {
-		required["ZOHO_WEBHOOK_TOKEN"] = c.ZohoWebhookToken
 	}
 	var missing []string
 	for k, v := range required {

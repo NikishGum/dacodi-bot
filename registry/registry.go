@@ -22,10 +22,19 @@ var (
 	ErrUnknownClient = errors.New("unknown client")
 	// ErrChatBound means the chat is already bound to a different client.
 	ErrChatBound = errors.New("chat already bound to another client")
+	// ErrChatLimit means the account already holds the maximum number of bound
+	// chats (maxChatsPerAccount).
+	ErrChatLimit = errors.New("account chat limit reached")
 	// ErrScanThrottled means a cold-miss full account scan was denied by the
 	// process-wide rate limiter (FIX-1). Callers treat it as transient.
 	ErrScanThrottled = errors.New("zoho account scan rate-limited")
 )
+
+// maxChatsPerAccount caps how many Telegram chats may bind to one account. A
+// company has several employees (each owning their own tickets); the cap bounds
+// the comma-separated cf_telegram_chat_id field and the blast radius of a leaked
+// token. 10 chat IDs fit comfortably in a Zoho single-line custom field.
+const maxChatsPerAccount = 10
 
 // scanLimiter is a process-wide token bucket of size one: it permits at most one
 // full Zoho account scan per interval, protecting the API-credit budget from
@@ -67,6 +76,13 @@ type Registry struct {
 	cfg    *config.Config
 	logger *slog.Logger
 	scan   *scanLimiter
+	// bindMu serializes the read-modify-write of an account's chat list across
+	// Bind/Revoke. A single process-wide mutex is sufficient and simplest:
+	// bindings are human-paced (token redemption, capped at 5/hour per chat), so
+	// contention is effectively nil; serializing two unrelated accounts for the
+	// duration of one bind is harmless and removes any lost-update race on the
+	// comma-separated cf_telegram_chat_id field.
+	bindMu sync.Mutex
 }
 
 // New constructs a Registry.
@@ -95,7 +111,7 @@ func (r *Registry) Authorize(ctx context.Context, chatID int64) (Profile, bool, 
 	switch {
 	case v == "":
 		// Cold cache: look the chat up in Zoho.
-		acc, err := r.resolveByChatID(ctx, chatID)
+		acc, err := r.resolveByChatID(ctx, chatID, false)
 		if err != nil {
 			if errors.Is(err, ErrScanThrottled) {
 				// The cold-miss limiter denied a scan: do not call Zoho. Cache the
@@ -141,9 +157,20 @@ func (r *Registry) Authorize(ctx context.Context, chatID int64) (Profile, bool, 
 }
 
 // Bind attaches a chat to the account identified by botClientID (token
-// redemption). It enforces isolation and handles re-binding to a new chat.
+// redemption). Multiple chats may bind to one account (a company's employees,
+// each owning their own tickets); binding appends the chat rather than replacing
+// the previous one. It enforces that a chat belongs to at most one account and
+// that an account does not exceed maxChatsPerAccount.
+//
+// The resolves here force a Zoho scan, bypassing the cold-miss limiter (FIX-1):
+// that limiter protects the anonymous Authorize path from credit drain, whereas
+// Bind is already gated by a verified token and the per-chat bind-attempt cap,
+// so it must not be starved by an unrelated stranger having just scanned.
 func (r *Registry) Bind(ctx context.Context, chatID int64, botClientID uint32) (Profile, error) {
-	acc, err := r.resolveByBotID(ctx, botClientID)
+	r.bindMu.Lock()
+	defer r.bindMu.Unlock()
+
+	acc, err := r.resolveByBotID(ctx, botClientID, true)
 	if err != nil {
 		return Profile{}, err
 	}
@@ -151,47 +178,62 @@ func (r *Registry) Bind(ctx context.Context, chatID int64, botClientID uint32) (
 		return Profile{}, ErrUnknownClient
 	}
 
-	// Isolation via cache.
+	// Isolation via cache: a positive auth pointing at a different client.
 	if v, err := r.store.GetAuth(ctx, chatID); err == nil && v != "" && v != store.AuthUnknown {
 		if id, perr := strconv.ParseUint(v, 10, 32); perr == nil && uint32(id) != botClientID {
 			return Profile{}, ErrChatBound
 		}
 	}
-	// Isolation via Zoho: is this chat already on another account?
-	if other, err := r.resolveByChatID(ctx, chatID); err != nil {
+
+	// Already on this account: idempotent re-bind. Refresh the cache and return
+	// without another Zoho write or a redundant isolation scan.
+	if acc.HasChat(chatID) {
+		p := profileFromAccount(acc)
+		r.cache(ctx, chatID, p)
+		return p, nil
+	}
+
+	// Isolation via Zoho: is this chat already on a different account? Only worth
+	// a lookup when it is not already on this one (handled above).
+	if other, err := r.resolveByChatID(ctx, chatID, true); err != nil {
 		return Profile{}, err
-	} else if other != nil && other.BotClientID != botClientID {
+	} else if other != nil && other.ID != acc.ID {
 		return Profile{}, ErrChatBound
 	}
 
-	// Re-binding: clear the account's previous chat binding.
-	if acc.ChatID != 0 && acc.ChatID != chatID {
-		if err := r.store.DelAuth(ctx, acc.ChatID); err != nil {
-			r.logger.Warn("clearing old auth on rebind failed", "old_chat_id", acc.ChatID, "error", err)
-		}
-		if err := r.store.DelAccountIDByChat(ctx, acc.ChatID); err != nil {
-			r.logger.Warn("clearing old chat index on rebind failed", "old_chat_id", acc.ChatID, "error", err)
-		}
+	if len(acc.ChatIDs) >= maxChatsPerAccount {
+		r.logger.Warn("account chat limit reached", "account_id", acc.ID, "bot_client_id", botClientID, "limit", maxChatsPerAccount)
+		return Profile{}, ErrChatLimit
 	}
 
-	if err := r.desk.SetAccountChatID(ctx, acc.ID, chatID); err != nil {
+	acc.ChatIDs = append(acc.ChatIDs, chatID)
+	if err := r.desk.SetAccountChatIDs(ctx, acc.ID, acc.ChatIDs); err != nil {
 		return Profile{}, err
 	}
-	acc.ChatID = chatID
 
 	p := profileFromAccount(acc)
 	r.cache(ctx, chatID, p)
 	return p, nil
 }
 
-// Revoke removes a chat's binding both in Zoho and in the cache.
+// Revoke removes a single chat's binding from its account in Zoho and clears its
+// cache, leaving any other chats on the same account intact.
 func (r *Registry) Revoke(ctx context.Context, chatID int64) error {
-	acc, err := r.resolveByChatID(ctx, chatID)
+	r.bindMu.Lock()
+	defer r.bindMu.Unlock()
+
+	acc, err := r.resolveByChatID(ctx, chatID, true)
 	if err != nil {
 		return err
 	}
 	if acc != nil {
-		if err := r.desk.SetAccountChatID(ctx, acc.ID, 0); err != nil {
+		remaining := make([]int64, 0, len(acc.ChatIDs))
+		for _, c := range acc.ChatIDs {
+			if c != chatID {
+				remaining = append(remaining, c)
+			}
+		}
+		if err := r.desk.SetAccountChatIDs(ctx, acc.ID, remaining); err != nil {
 			return err
 		}
 	}
@@ -204,7 +246,10 @@ func (r *Registry) Revoke(ctx context.Context, chatID int64) error {
 // resolveByBotID returns the account for a bot client ID. It first tries the
 // Redis reverse index for a single-call GET /accounts/{id}; on a miss (or a
 // stale entry) it falls back to the full account scan and refreshes the index.
-func (r *Registry) resolveByBotID(ctx context.Context, botClientID uint32) (*zoho.AccountInfo, error) {
+// When force is true the cold-miss scan limiter is bypassed (used by Bind, which
+// is already token-gated — see FIX-1); otherwise a throttled scan returns
+// ErrScanThrottled.
+func (r *Registry) resolveByBotID(ctx context.Context, botClientID uint32, force bool) (*zoho.AccountInfo, error) {
 	if id, err := r.store.GetAccountIDByBot(ctx, botClientID); err == nil && id != "" {
 		acc, aerr := r.desk.AccountByID(ctx, id)
 		if aerr != nil {
@@ -215,7 +260,7 @@ func (r *Registry) resolveByBotID(ctx context.Context, botClientID uint32) (*zoh
 		}
 		// Stale index (account deleted or its cf_bot_client_id changed): rescan.
 	}
-	if !r.scan.allow() {
+	if !force && !r.scan.allow() {
 		return nil, ErrScanThrottled
 	}
 	acc, err := r.desk.AccountByBotClientID(ctx, botClientID)
@@ -229,14 +274,15 @@ func (r *Registry) resolveByBotID(ctx context.Context, botClientID uint32) (*zoh
 }
 
 // resolveByChatID returns the account bound to a chat, using the reverse index
-// first and falling back to the scan, mirroring resolveByBotID.
-func (r *Registry) resolveByChatID(ctx context.Context, chatID int64) (*zoho.AccountInfo, error) {
+// first and falling back to the scan, mirroring resolveByBotID. force has the
+// same meaning: bypass the cold-miss scan limiter for token-gated callers.
+func (r *Registry) resolveByChatID(ctx context.Context, chatID int64, force bool) (*zoho.AccountInfo, error) {
 	if id, err := r.store.GetAccountIDByChat(ctx, chatID); err == nil && id != "" {
 		acc, aerr := r.desk.AccountByID(ctx, id)
 		if aerr != nil {
 			return nil, aerr
 		}
-		if acc != nil && acc.ChatID == chatID {
+		if acc != nil && acc.HasChat(chatID) {
 			return acc, nil
 		}
 		// Stale: the chat moved off this account (or it was deleted). Drop it.
@@ -244,7 +290,7 @@ func (r *Registry) resolveByChatID(ctx context.Context, chatID int64) (*zoho.Acc
 			r.logger.Warn("dropping stale chat index failed", "chat_id", chatID, "error", derr)
 		}
 	}
-	if !r.scan.allow() {
+	if !force && !r.scan.allow() {
 		return nil, ErrScanThrottled
 	}
 	acc, err := r.desk.AccountByChatID(ctx, chatID)
@@ -264,9 +310,9 @@ func (r *Registry) indexAccount(ctx context.Context, acc *zoho.AccountInfo) {
 			r.logger.Warn("indexing account by bot id failed", "bot_client_id", acc.BotClientID, "error", err)
 		}
 	}
-	if acc.ChatID != 0 {
-		if err := r.store.SetAccountIDByChat(ctx, acc.ChatID, acc.ID); err != nil {
-			r.logger.Warn("indexing account by chat id failed", "chat_id", acc.ChatID, "error", err)
+	for _, chatID := range acc.ChatIDs {
+		if err := r.store.SetAccountIDByChat(ctx, chatID, acc.ID); err != nil {
+			r.logger.Warn("indexing account by chat id failed", "chat_id", chatID, "error", err)
 		}
 	}
 }
@@ -281,7 +327,7 @@ func (r *Registry) profileByID(ctx context.Context, botClientID uint32) (Profile
 		}
 	}
 
-	acc, err := r.resolveByBotID(ctx, botClientID)
+	acc, err := r.resolveByBotID(ctx, botClientID, false)
 	if err != nil {
 		return Profile{}, false, err
 	}

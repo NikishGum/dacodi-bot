@@ -497,3 +497,11 @@ func (c *Client) IncrBindAttempts(ctx context.Context, chatID int64) (int64, err
 	}
 	return n, nil
 }
+
+// RefundBindAttempt cancels one increment of the per-chat attempt counter. It is
+// used when a binding fails for a transient infrastructure reason (Redis/Zoho
+// outage) rather than a wrong token, so an outage does not consume the client's
+// brute-force budget. The TTL set at first increment is left untouched.
+func (c *Client) RefundBindAttempt(ctx context.Context, chatID int64) error {
+	return c.rdb.Decr(ctx, "bind_attempts:"+strconv.FormatInt(chatID, 10)).Err()
+}

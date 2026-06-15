@@ -291,16 +291,31 @@ func (b *Bot) loadConversation(ctx context.Context, chatID int64) (*Conversation
 		return nil, err
 	}
 	if data == nil {
-		return &Conversation{ChatID: chatID, State: StateIdle}, nil
+		return b.freshConversation(ctx, chatID), nil
 	}
 	var conv Conversation
 	if err := json.Unmarshal(data, &conv); err != nil {
 		// Corrupt state is not fatal: start fresh rather than wedge the chat.
 		b.logger.Warn("corrupt conversation state, resetting", "chat_id", chatID, "error", err)
-		return &Conversation{ChatID: chatID, State: StateIdle}, nil
+		return b.freshConversation(ctx, chatID), nil
 	}
 	conv.ChatID = chatID
 	return &conv, nil
+}
+
+// freshConversation builds the conversation for a chat with no (or unusable) FSM
+// state. The FSM key expires after 24h but a ticket lives for 30d, so a client
+// who returns to an open ticket after a day of silence must resume in
+// StateTicketOpen — otherwise their next message would start a brand-new flow
+// and create a second ticket while the first is still open. When no ticket is
+// active the chat starts idle as usual.
+func (b *Bot) freshConversation(ctx context.Context, chatID int64) *Conversation {
+	if ref, err := b.store.GetTicket(ctx, chatID); err != nil {
+		b.logger.Warn("checking active ticket on cold conversation failed", "chat_id", chatID, "error", err)
+	} else if ref.ID != "" {
+		return &Conversation{ChatID: chatID, State: StateTicketOpen}
+	}
+	return &Conversation{ChatID: chatID, State: StateIdle}
 }
 
 func (b *Bot) saveConversation(ctx context.Context, conv *Conversation) error {

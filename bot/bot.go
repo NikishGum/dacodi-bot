@@ -128,6 +128,58 @@ func (b *Bot) WebhookHandler() http.HandlerFunc {
 	}
 }
 
+// AdminUnbindHandler returns the HTTP handler for POST /admin/unbind, an
+// internal operator endpoint to revoke one chat's binding. It is guarded by the
+// admin API key and must only be reachable internally — it is served on the same
+// loopback SERVER_ADDR as the rest of the bot. main.go mounts it only when an
+// admin key is configured. Body: {"chat_id": <int64>} (bot_client_id optional,
+// for the audit log).
+func (b *Bot) AdminUnbindHandler() http.HandlerFunc {
+	type request struct {
+		ChatID      int64  `json:"chat_id"`
+		BotClientID uint32 `json:"bot_client_id,omitempty"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if b.cfg.AdminAPIKey == "" ||
+			subtle.ConstantTimeCompare([]byte(r.Header.Get("X-API-Key")), []byte(b.cfg.AdminAPIKey)) != 1 {
+			b.logger.Warn("admin unbind rejected: bad api key", "remote", r.RemoteAddr)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+
+		var req request
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if req.ChatID == 0 {
+			http.Error(w, "chat_id is required", http.StatusBadRequest)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), updateTimeout)
+		defer cancel()
+
+		// Serialize against concurrent updates for this chat.
+		lock := b.chatLock(req.ChatID)
+		lock.Lock()
+		defer lock.Unlock()
+
+		if err := b.unbindChat(ctx, req.ChatID); err != nil {
+			b.logger.Error("admin unbind failed", "chat_id", req.ChatID, "error", err)
+			http.Error(w, "unbind failed", http.StatusInternalServerError)
+			return
+		}
+		b.logger.Info("chat unbound by admin", "chat_id", req.ChatID, "bot_client_id", req.BotClientID, "remote", r.RemoteAddr)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}
+}
+
 // StartPolling runs long-polling until ctx is cancelled. Used when
 // TELEGRAM_MODE=polling (local development without a public URL).
 func (b *Bot) StartPolling(ctx context.Context) {
@@ -176,6 +228,19 @@ func (b *Bot) ConfigureWebhook(ctx context.Context) error {
 	}
 	b.logger.Info("telegram webhook configured", "url", params["url"])
 	return nil
+}
+
+// ConfigureCommands registers the client-facing command menu with Telegram so
+// /start and /status are discoverable. Best-effort: a failure only costs menu
+// hints, the commands still work when typed.
+func (b *Bot) ConfigureCommands() {
+	cmds := tgbotapi.NewSetMyCommands(
+		tgbotapi.BotCommand{Command: "start", Description: "Создать обращение или ввести ключ доступа"},
+		tgbotapi.BotCommand{Command: "status", Description: "Статус текущего обращения"},
+	)
+	if _, err := b.api.Request(cmds); err != nil {
+		b.logger.Warn("setting bot commands failed", "error", err)
+	}
 }
 
 // ---- send helpers ----

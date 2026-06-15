@@ -8,3 +8,6 @@ config/clients.local.json
 
 # Build artifacts
 /build/
+
+.claude/
+.vscode/

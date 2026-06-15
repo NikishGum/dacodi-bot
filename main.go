@@ -19,7 +19,6 @@ import (
 	"supportbot/queue"
 	store "supportbot/redis"
 	"supportbot/registry"
-	"supportbot/webhook"
 	"supportbot/zoho"
 )
 
@@ -87,6 +86,7 @@ func run() error {
 	tokenMgr := auth.NewManager(cfg.BindingTokenSecret, cfg.BindingTokenTTL, api.Self.UserName)
 
 	b := bot.New(api, cfg, st, desk, worker, reg, tokenMgr, logger)
+	b.ConfigureCommands()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler(st))
@@ -99,17 +99,18 @@ func run() error {
 		mux.HandleFunc("/telegram/webhook", b.WebhookHandler())
 	}
 
-	// Operator replies and ticket closures reach the bot either by Zoho pushing
-	// to /zoho/webhook, or — when Zoho webhooks are unavailable — by the poller
-	// pulling from Zoho on a timer. Exactly one path is active.
-	switch cfg.ZohoSyncMode {
-	case "poll":
-		p := poller.New(st, desk, api, cfg.ZohoPollInterval, logger)
-		go p.Run(ctx)
-	case "webhook":
-		zohoHandler := webhook.NewZohoHandler(api, st, cfg.ZohoWebhookToken, logger)
-		mux.Handle("/zoho/webhook", zohoHandler)
+	// Internal operator endpoint to revoke a chat's binding. Mounted only when an
+	// admin key is set; it is served on the loopback SERVER_ADDR and guarded by
+	// the key, so it must never be exposed publicly.
+	if cfg.AdminAPIKey != "" {
+		mux.HandleFunc("/admin/unbind", b.AdminUnbindHandler())
+		logger.Info("admin unbind endpoint mounted at /admin/unbind")
 	}
+
+	// Operator replies and ticket closures reach the bot by the poller pulling
+	// from Zoho on a timer (inbound Zoho webhooks are not used in this deployment).
+	p := poller.New(st, desk, api, cfg.ZohoPollInterval, logger)
+	go p.Run(ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.ServerAddr,

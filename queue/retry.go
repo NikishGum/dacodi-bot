@@ -149,8 +149,10 @@ func (w *Worker) flushPendingComments(ctx context.Context, chatID int64, ticketI
 		w.logger.Error("reading pending comments failed", "chat_id", chatID, "error", err)
 		return
 	}
+	// Lines are stored already formatted (handle + text) by forwardToTicket, so
+	// post them verbatim.
 	for _, content := range comments {
-		if err := w.desk.AddComment(ctx, ticketID, "Клиент: "+content); err != nil {
+		if err := w.desk.AddComment(ctx, ticketID, content); err != nil {
 			w.logger.Error("flushing pending comment failed", "chat_id", chatID, "ticket_id", ticketID, "error", err)
 		}
 	}
